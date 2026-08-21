@@ -1,5 +1,4 @@
 import { extension_settings } from "../../../extensions.js";
-import { saveSettingsDebounced } from "../../../../script.js";
 
 const MODULE_NAME = "crosscheck";
 const PCC_MODULE_NAME = "persistent-custom-css";
@@ -8,13 +7,9 @@ const MAX_RESULTS = 60;
 const VISIBLE_RESULTS_PER_SECTION = 6;
 const MAX_ERRORS = 30;
 
-const defaultSettings = {
-    includeDisabledPersistentCss: true,
-};
+const defaultSettings = {};
 
 let latestReport = null;
-let picking = false;
-let highlightedElement = null;
 let styleMutationObserver = null;
 const recentErrors = [];
 const recentStyleChanges = [];
@@ -29,6 +24,33 @@ function getSettings() {
         if (!(key in settings)) settings[key] = value;
     }
     return settings;
+}
+
+function normalizedExtensionPath(value) {
+    return String(value || "")
+        .replace(/^\/+/g, "")
+        .replace(/^scripts\/extensions\//i, "")
+        .replace(/\/$/, "");
+}
+
+function disabledExtensionNames() {
+    const candidates = [
+        extension_settings.disabledExtensions,
+        extension_settings.disabled_extensions,
+        extension_settings.disabled,
+    ];
+    const disabled = candidates.find(Array.isArray) || [];
+    return new Set(disabled.flatMap(value => {
+        const path = normalizedExtensionPath(value);
+        const basename = path.split("/").pop();
+        return [path, basename].filter(Boolean);
+    }));
+}
+
+function isExtensionDisabled(path) {
+    const normalized = normalizedExtensionPath(path);
+    const disabled = disabledExtensionNames();
+    return disabled.has(normalized) || disabled.has(normalized.split("/").pop());
 }
 
 function escapeHtml(value) {
@@ -96,54 +118,6 @@ function splitSelectors(selectorText) {
     }
     if (current.trim()) selectors.push(current.trim());
     return selectors;
-}
-
-function specificity(selector) {
-    let text = String(selector ?? "")
-        .replace(/:where\((?:[^()]|\([^()]*\))*\)/g, "")
-        .replace(/\\./g, "x")
-        .replace(/\[[^\]]*\]/g, "[]");
-
-    const ids = (text.match(/#[\w-]+/g) || []).length;
-    const attrs = (text.match(/\[\]/g) || []).length;
-    const classes = (text.match(/\.[\w-]+/g) || []).length;
-    const pseudoClasses = (text.match(/:(?!:)[\w-]+(?:\([^)]*\))?/g) || []).length;
-    text = text
-        .replace(/#[\w-]+/g, " ")
-        .replace(/\.[\w-]+/g, " ")
-        .replace(/\[\]/g, " ")
-        .replace(/::?[\w-]+(?:\([^)]*\))?/g, " ")
-        .replace(/[>+~*]/g, " ");
-    const elements = (text.match(/(^|\s|\|)[a-zA-Z][\w-]*/g) || []).length;
-    const pseudoElements = (String(selector).match(/::[\w-]+/g) || []).length;
-    return [ids, attrs + classes + pseudoClasses, elements + pseudoElements];
-}
-
-function compareSpecificity(a, b) {
-    for (let i = 0; i < 3; i += 1) {
-        if (a[i] !== b[i]) return a[i] - b[i];
-    }
-    return 0;
-}
-
-function propertyFamily(property) {
-    const prop = String(property ?? "").toLowerCase();
-    if (prop.startsWith("--")) return prop;
-    if (/^(margin|padding)(-|$)/.test(prop)) return prop.split("-")[0];
-    if (/^inset(-|$)/.test(prop) || /^(top|right|bottom|left)$/.test(prop)) return "inset";
-    if (/^border($|-top|-right|-bottom|-left)(-|$)/.test(prop)) {
-        const side = prop.match(/^border-(top|right|bottom|left)/)?.[1];
-        return side ? `border-${side}` : "border";
-    }
-    if (/^border-radius$|^border-(top|bottom)-(left|right)-radius$/.test(prop)) return "border-radius";
-    if (/^background($|-)/.test(prop)) return "background";
-    if (/^font($|-)/.test(prop)) return "font";
-    if (/^animation($|-)/.test(prop)) return "animation";
-    if (/^transition($|-)/.test(prop)) return "transition";
-    if (/^overflow($|-)/.test(prop)) return "overflow";
-    if (/^flex($|-)/.test(prop)) return "flex";
-    if (/^grid($|-)/.test(prop)) return "grid";
-    return prop;
 }
 
 function isInterestingSource(source) {
@@ -233,7 +207,6 @@ function walkCssRules(ruleList, source, state, output, diagnostics) {
                         selector,
                         normalizedSelector: normalizeWhitespace(selector),
                         property,
-                        family: propertyFamily(property),
                         value,
                         important: rule.style.getPropertyPriority(property) === "important",
                         active: state.active,
@@ -241,7 +214,6 @@ function walkCssRules(ruleList, source, state, output, diagnostics) {
                         media: state.media,
                         source,
                         order: state.order,
-                        specificity: specificity(selector),
                     });
                 }
             }
@@ -318,7 +290,7 @@ function parseCssText(cssText, source, active, orderStart, diagnostics) {
     }
 }
 
-function collectPersistentCssRules(orderStart, includeDisabled, diagnostics) {
+function collectPersistentCssRules(orderStart, diagnostics) {
     const pcc = extension_settings[PCC_MODULE_NAME];
     if (!pcc || !Array.isArray(pcc.entries)) {
         return { rules: [], order: orderStart, entryCount: 0, activeEntryCount: 0 };
@@ -331,7 +303,7 @@ function collectPersistentCssRules(orderStart, includeDisabled, diagnostics) {
 
     for (const [index, entry] of pcc.entries.entries()) {
         if (!entry?.css?.trim()) continue;
-        if (!entry.enabled && !includeDisabled) continue;
+        if (!entry.enabled) continue;
         if (entry.enabled) activeEntryCount += 1;
 
         const folder = entry.folderId ? folderMap.get(entry.folderId) : "";
@@ -360,7 +332,6 @@ function collectPersistentCssRules(orderStart, includeDisabled, diagnostics) {
 }
 
 async function collectAllCssRules() {
-    const settings = getSettings();
     const output = [];
     const diagnostics = { inaccessibleSheets: [], parseErrors: [], keyframes: [] };
     let order = 0;
@@ -370,6 +341,7 @@ async function collectAllCssRules() {
     for (const [index, sheet] of styleSheets.entries()) {
         const source = sourceFromStyleSheet(sheet, index);
         if (source.skip || isCrosscheckSource(source)) continue;
+        if (source.kind === "extension" && isExtensionDisabled(source.extensionPath)) continue;
 
         const sheetMedia = sheet.media?.mediaText || "";
         const active = !sheet.disabled && mediaIsActive(sheetMedia);
@@ -388,7 +360,7 @@ async function collectAllCssRules() {
         if (index > 0 && index % 12 === 0) await nextFrame();
     }
 
-    const persistent = collectPersistentCssRules(order + 10000, settings.includeDisabledPersistentCss, diagnostics);
+    const persistent = collectPersistentCssRules(order + 10000, diagnostics);
     output.push(...persistent.rules);
 
     return {
@@ -412,33 +384,27 @@ function displayDeclaration(record) {
     return `${record.property}: ${shortText(record.value, 130)}${record.important ? " !important" : ""}`;
 }
 
-function isStructuralProperty(property) {
-    const prop = String(property || "").toLowerCase();
-    return /^(display|position|z-index|visibility|opacity|pointer-events|overflow(?:-|$)|width$|height$|min-|max-|flex(?:-|$)|grid(?:-|$)|order$|float$|clear$|transform(?:-|$)|translate$|scale$|rotate$|top$|right$|bottom$|left$|inset(?:-|$)|margin(?:-|$)|padding(?:-|$)|box-sizing$|content$|clip(?:-|$))/.test(prop);
-}
-
 function shouldReportRuleConflict(records) {
-    const activeOrPotential = records.filter(Boolean);
-    const actorRecords = activeOrPotential.filter(record => ["persistent", "extension"].includes(record.source.kind));
-    const actorSources = distinctSources(actorRecords);
-    const hasTheme = activeOrPotential.some(record => ["theme", "custom"].includes(record.source.kind));
-    const hasCore = activeOrPotential.some(record => record.source.kind === "core");
-    const hasImportant = activeOrPotential.some(record => record.important);
-    const property = activeOrPotential[0]?.property;
+    // SillyTavern 기본 CSS는 확장과 사용자 CSS가 덮어쓰라고 있는 기준값이므로 제외한다.
+    // 현재 활성화된 테마·확장·등록 CSS끼리 실제로 경쟁하는 경우만 남긴다.
+    const actors = records.filter(record => record.active && ["persistent", "extension", "theme", "custom"].includes(record.source.kind));
+    if (distinctSources(actors).size < 2) return false;
 
-    // 서로 다른 등록 CSS/확장이 같은 속성을 만지는 경우가 가장 확실한 충돌 후보다.
-    if (actorSources.size >= 2) return true;
-    // 테마나 기본 CSS를 단순히 꾸며서 덮는 것은 정상 동작이다. 레이아웃을 바꾸거나
-    // !important가 개입한 경우에만 전체 검사에서 보여준다.
-    if (actorSources.size === 1 && hasTheme) return isStructuralProperty(property) || hasImportant;
-    if (actorSources.size === 1 && hasCore) return isStructuralProperty(property) && hasImportant;
-    return false;
+    // !important 여부가 다르면 승자가 명확한 의도적 덮어쓰기다. 가장 높은 단계끼리만 비교한다.
+    const importantWins = actors.some(record => record.important);
+    const priorityActors = actors.filter(record => record.important === importantWins);
+    if (distinctSources(priorityActors).size < 2) return false;
+
+    // 같은 선택자끼리 묶였으므로 명시도는 동일하다. 같은 우선순위에서 값이 다르면
+    // 마지막에 로드된 순서에 따라 결과가 달라지는 실제 CSS 경쟁이다.
+    const values = new Set(priorityActors.map(record => normalizeWhitespace(record.value)));
+    return values.size > 1;
 }
 
 function conflictResultsFromRules(rules) {
     const groups = new Map();
 
-    for (const rule of rules) {
+    for (const rule of rules.filter(rule => rule.active)) {
         const key = `${rule.normalizedSelector}\u0000${rule.property}`;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(rule);
@@ -449,28 +415,25 @@ function conflictResultsFromRules(rules) {
         if (records.length < 2 || distinctSources(records).size < 2 || distinctDeclarations(records).size < 2) continue;
         if (!records.some(record => isInterestingSource(record.source))) continue;
 
-        const activeRecords = records.filter(record => record.active);
-        const activeSources = distinctSources(activeRecords);
-        const activeDeclarations = distinctDeclarations(activeRecords);
-        const confirmedCandidate = activeRecords.length > 1 && activeSources.size > 1 && activeDeclarations.size > 1;
-        const hasInactive = records.some(record => !record.active);
-        const relevantRecords = confirmedCandidate ? activeRecords : records;
-        if (!shouldReportRuleConflict(relevantRecords)) continue;
+        if (!shouldReportRuleConflict(records)) continue;
         const selector = records[0].selector;
         const property = records[0].property;
-        const sorted = [...records].sort((a, b) => a.order - b.order);
+        const importantWins = records.some(record => record.active && record.important && ["persistent", "extension", "theme", "custom"].includes(record.source.kind));
+        const sorted = records
+            .filter(record => ["persistent", "extension", "theme", "custom"].includes(record.source.kind))
+            .filter(record => record.important === importantWins)
+            .sort((a, b) => a.order - b.order);
         const lines = sorted.slice(-6).map(record => ({
             source: record.source.label,
-            text: `${displayDeclaration(record)}${record.active ? "" : " · 현재 비활성"}${record.media ? ` · @media ${record.media}` : ""}`,
+            text: `${displayDeclaration(record)}${record.media ? ` · @media ${record.media}` : ""}`,
         }));
 
         candidates.push({
-            level: confirmedCandidate ? "high" : "medium",
-            title: confirmedCandidate ? "활성 CSS 충돌 후보" : "비활성 CSS 잠재 충돌",
+            level: "high",
+            title: "활성 CSS 로드 순서 충돌",
             selector,
             property,
             lines,
-            inactive: !confirmedCandidate && hasInactive,
         });
     }
 
@@ -498,39 +461,13 @@ function conflictResultsFromRules(rules) {
             meta: `${item.selector} · ${item.properties.slice(0, 8).join(", ")}${item.properties.length > 8 ? "…" : ""}`,
             lines: item.lines.slice(-10),
         }))
-        .sort((a, b) => (a.level === b.level ? 0 : a.level === "high" ? -1 : 1))
         .slice(0, MAX_RESULTS);
-}
-
-function duplicateIdResults() {
-    const byId = new Map();
-    for (const element of document.querySelectorAll("[id]")) {
-        if (!element.id || element.closest("#crosscheck-overlay")) continue;
-        if (!byId.has(element.id)) byId.set(element.id, []);
-        byId.get(element.id).push(element);
-    }
-
-    return Array.from(byId.entries())
-        .filter(([id, elements]) => {
-            if (elements.length < 2) return false;
-            if (/^[0-9]+$/.test(id)) return false;
-            if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) return false;
-            if (elements.every(element => element.classList.contains("tag"))) return false;
-            return true;
-        })
-        .slice(0, 15)
-        .map(([id, elements]) => ({
-            level: "medium",
-            title: "중복 DOM ID",
-            meta: `#${id}가 화면에 ${elements.length}개 존재합니다. 같은 요소를 찾는 확장끼리 엉뚱한 대상을 수정할 수 있습니다.`,
-            lines: elements.slice(0, 4).map(element => ({ source: "화면 요소", text: elementDescriptor(element) })),
-        }));
 }
 
 function keyframeResults(keyframes) {
     const groups = new Map();
     for (const item of keyframes) {
-        if (!item.active) continue;
+        if (!item.active || !["persistent", "extension", "theme", "custom"].includes(item.source.kind)) continue;
         if (!groups.has(item.name)) groups.set(item.name, []);
         groups.get(item.name).push(item);
     }
@@ -563,6 +500,7 @@ function discoverLoadedExtensionPaths() {
         .map(extensionPathFromUrl)
         .filter(Boolean)
         .filter(path => !/crosscheck|CrossCheck-main/i.test(path))
+        .filter(path => !isExtensionDisabled(path))
         .filter((value, index, array) => array.indexOf(value) === index)
         .sort((a, b) => a.localeCompare(b));
 }
@@ -608,7 +546,6 @@ function extensionCodeResults(manifests) {
     const globalNames = new Map();
     const settingKeys = new Map();
     const createdIds = new Map();
-    const riskyPatches = [];
 
     function add(map, key, item) {
         if (!key) return;
@@ -637,15 +574,6 @@ function extensionCodeResults(manifests) {
             add(createdIds, id, { ...item, displayName });
         }
 
-        const patchPatterns = [
-            [/(?:window|globalThis)\.fetch\s*=/, "전역 fetch 교체"],
-            [/EventTarget\.prototype\.addEventListener\s*=/, "addEventListener 프로토타입 교체"],
-            [/(?:jQuery|\$)\.fn\.[A-Za-z_$][\w$]*\s*=/, "jQuery 전역 기능 추가/교체"],
-            [/MutationObserver\.prototype\.[A-Za-z_$][\w$]*\s*=/, "MutationObserver 프로토타입 교체"],
-        ];
-        for (const [pattern, label] of patchPatterns) {
-            if (pattern.test(code)) riskyPatches.push({ item, displayName, label });
-        }
     }
 
     const results = [];
@@ -678,14 +606,6 @@ function extensionCodeResults(manifests) {
             title: "생성 DOM ID 중복 가능성",
             meta: `#${id}를 여러 확장 코드에서 생성합니다.`,
             lines: Array.from(unique.values()).map(item => ({ source: item.displayName, text: item.path })),
-        });
-    }
-    for (const patch of riskyPatches) {
-        results.push({
-            level: "medium",
-            title: "전역 동작 변경 감지",
-            meta: `${patch.displayName}: ${patch.label}`,
-            lines: [{ source: patch.item.path, text: "다른 확장의 실행에도 영향을 줄 수 있으므로 오류 발생 시 우선 확인하세요." }],
         });
     }
     return results.slice(0, 80);
@@ -754,98 +674,12 @@ function errorResults() {
     }));
 }
 
-function winnerFromRecords(records) {
-    return [...records].sort((a, b) => {
-        if (a.important !== b.important) return a.important ? 1 : -1;
-        if (a.inline !== b.inline) return a.inline ? 1 : -1;
-        const specificityDifference = compareSpecificity(a.specificity, b.specificity);
-        if (specificityDifference !== 0) return specificityDifference;
-        return a.order - b.order;
-    }).at(-1);
-}
-
-function selectorCanMatchElement(selector) {
-    return !/::(?:before|after|first-letter|first-line|selection|backdrop|marker|placeholder|file-selector-button)/i.test(selector);
-}
-
-function safeMatches(element, selector) {
-    if (!selectorCanMatchElement(selector)) return false;
-    try {
-        return element.matches(selector);
-    } catch {
-        return false;
-    }
-}
-
-function elementDescriptor(element) {
-    if (!(element instanceof Element)) return "알 수 없는 요소";
-    let descriptor = element.tagName.toLowerCase();
-    if (element.id) descriptor += `#${element.id}`;
-    const classes = Array.from(element.classList).filter(name => name !== "crosscheck-pick-target").slice(0, 4);
-    if (classes.length) descriptor += `.${classes.join(".")}`;
-    return descriptor;
-}
-
-function elementConflictResults(element, rules) {
-    const matching = rules.filter(rule => rule.active && safeMatches(element, rule.selector));
-    let order = Math.max(0, ...matching.map(rule => rule.order)) + 10000;
-
-    for (const property of Array.from(element.style || [])) {
-        matching.push({
-            selector: "style 속성",
-            normalizedSelector: "style 속성",
-            property,
-            family: propertyFamily(property),
-            value: element.style.getPropertyValue(property).trim(),
-            important: element.style.getPropertyPriority(property) === "important",
-            active: true,
-            source: { key: "inline-attribute", label: "요소의 style 속성", kind: "custom" },
-            order: order++,
-            specificity: [1000, 0, 0],
-            inline: true,
-        });
-    }
-
-    const groups = new Map();
-    for (const rule of matching) {
-        if (!groups.has(rule.property)) groups.set(rule.property, []);
-        groups.get(rule.property).push(rule);
-    }
-
-    const computed = getComputedStyle(element);
-    const results = [];
-    for (const [property, records] of groups.entries()) {
-        if (records.length < 2 || distinctSources(records).size < 2 || distinctDeclarations(records).size < 2) continue;
-        if (!records.some(record => isInterestingSource(record.source))) continue;
-
-        const winner = winnerFromRecords(records);
-        const computedValue = computed.getPropertyValue(winner.property).trim();
-        const sorted = [...records].sort((a, b) => a.order - b.order);
-        const lines = sorted.slice(-8).map(record => ({
-            source: record.source.label,
-            text: `${record.selector} → ${displayDeclaration(record)}${record === winner ? " · 우선 적용 예상" : ""}`,
-        }));
-        results.push({
-            level: "high",
-            title: "선택 요소에 실제로 겹치는 규칙",
-            meta: `${property} · 현재 계산값: ${shortText(computedValue || "확인 불가", 120)}`,
-            lines,
-        });
-    }
-
-    return results.slice(0, MAX_RESULTS);
-}
-
-function sourceCount(rules) {
-    return new Set(rules.map(rule => rule.source.key)).size;
-}
-
 function buildReportText(report) {
     const lines = [
         `🔀 크로스체크 진단 결과`,
         `검사 시각: ${new Date(report.createdAt).toLocaleString()}`,
-        `검사 유형: ${report.mode === "element" ? `요소 선택 (${report.target})` : "전체 검사"}`,
-        `로드 확장: ${report.summary.extensions} / CSS 출처: ${report.summary.sources} / 충돌·주의: ${report.summary.issues}`,
+        `검사 기준: 현재 활성화된 확장과 등록 CSS만`,
+        `활성 외부 확장: ${report.summary.extensions} / 활성 등록 CSS: ${report.summary.activeCssEntries} / CSS 충돌: ${report.summary.cssIssues} / JS 충돌: ${report.summary.jsIssues}`,
         "",
     ];
 
@@ -948,8 +782,7 @@ function enforceDialogLayout(open) {
 function renderReport(report) {
     latestReport = report;
     const body = document.querySelector("#crosscheck-dialog-body");
-    const title = report.mode === "element" ? `요소 검사 · ${report.target}` : "전체 검사 결과";
-    document.querySelector("#crosscheck-dialog-title").textContent = title;
+    document.querySelector("#crosscheck-dialog-title").textContent = "활성 확장 검사 결과";
 
     const sections = report.sections.map((section, sectionIndex) => `
         <section class="cc-section">
@@ -957,14 +790,14 @@ function renderReport(report) {
             ${section.items.length ? section.items.map((item, index) => reportItemHtml(item, index >= VISIBLE_RESULTS_PER_SECTION)).join("") : '<div class="cc-empty">발견된 항목이 없습니다.</div>'}
             ${section.items.length > VISIBLE_RESULTS_PER_SECTION ? `<button type="button" class="menu_button cc-show-more" data-section="${sectionIndex}" data-more="${section.items.length - VISIBLE_RESULTS_PER_SECTION}">${section.items.length - VISIBLE_RESULTS_PER_SECTION}개 더 보기</button>` : ""}
         </section>
-    `).join("");
+    `).join("") || '<div class="cc-empty">현재 활성 상태에서 확인된 충돌이 없습니다.</div>';
 
     body.innerHTML = `
         <div class="cc-summary">
-            <div class="cc-summary-card"><span class="cc-summary-number">${report.summary.extensions}</span><span class="cc-summary-label">로드 확장</span></div>
-            <div class="cc-summary-card"><span class="cc-summary-number">${report.summary.sources}</span><span class="cc-summary-label">CSS 출처</span></div>
-            <div class="cc-summary-card"><span class="cc-summary-number">${report.summary.rules}</span><span class="cc-summary-label">CSS 선언</span></div>
-            <div class="cc-summary-card"><span class="cc-summary-number">${report.summary.issues}</span><span class="cc-summary-label">충돌·주의</span></div>
+            <div class="cc-summary-card"><span class="cc-summary-number">${report.summary.extensions}</span><span class="cc-summary-label">활성 외부확장</span></div>
+            <div class="cc-summary-card"><span class="cc-summary-number">${report.summary.activeCssEntries}</span><span class="cc-summary-label">활성 등록CSS</span></div>
+            <div class="cc-summary-card"><span class="cc-summary-number">${report.summary.cssIssues}</span><span class="cc-summary-label">CSS 충돌</span></div>
+            <div class="cc-summary-card"><span class="cc-summary-number">${report.summary.jsIssues}</span><span class="cc-summary-label">JS 충돌</span></div>
         </div>
         ${sections}
     `;
@@ -978,6 +811,8 @@ function renderReport(report) {
     });
     document.querySelector("#crosscheck-overlay").classList.add("cc-open");
     enforceDialogLayout(true);
+    const reopenButton = document.querySelector("#crosscheck-open-last");
+    if (reopenButton) reopenButton.disabled = false;
 }
 
 function closeReport() {
@@ -991,61 +826,35 @@ async function runFullScan() {
     setStatus("확장과 CSS를 검사하는 중…");
 
     try {
+        const paths = discoverLoadedExtensionPaths();
         const css = await collectAllCssRules();
         await nextFrame();
-        const paths = discoverLoadedExtensionPaths();
-        const manifestData = await loadExtensionManifests(paths);
+        const thirdPartyPaths = paths.filter(path => path.startsWith("third-party/"));
+        const manifestData = await loadExtensionManifests(thirdPartyPaths);
         const cssConflicts = conflictResultsFromRules(css.rules);
         const manifests = [
             ...manifestResults(manifestData.manifests, paths),
             ...extensionCodeResults(manifestData.manifests),
         ];
-        const duplicateIds = duplicateIdResults();
         const keyframes = keyframeResults(css.diagnostics.keyframes);
         const errors = errorResults();
-        const readWarnings = [
-            ...css.diagnostics.inaccessibleSheets.map(item => ({
-                level: "low",
-                title: "CSS 내부 규칙 접근 제한",
-                meta: item.source.label,
-                lines: [{ source: item.source.href || item.source.key, text: item.message }],
-            })),
-            ...css.diagnostics.parseErrors.map(item => ({
-                level: "low",
-                title: "등록 CSS 해석 실패",
-                meta: item.source.label,
-                lines: [{ source: item.source.key, text: item.message }],
-            })),
-            ...manifestData.failures.map(item => ({
-                level: "low",
-                title: "확장 manifest 접근 실패",
-                meta: item.path,
-                lines: [{ source: item.path, text: item.message }],
-            })),
-            ...manifestData.manifests.filter(item => item.jsError).map(item => ({
-                level: "low",
-                title: "확장 진입 JS 접근 실패",
-                meta: item.manifest.display_name || item.path,
-                lines: [{ source: item.path, text: item.jsError }],
-            })),
-        ];
 
+        const cssItems = [...cssConflicts, ...keyframes];
         const sections = [
-            { title: "CSS 충돌 후보", items: cssConflicts },
-            { title: "확장 구조 검사", items: manifests },
-            { title: "화면 구조 검사", items: [...duplicateIds, ...keyframes] },
+            { title: "활성 CSS 로드 순서 충돌", items: cssItems },
+            { title: "활성 확장 JavaScript 충돌", items: manifests },
             { title: "최근 실행 오류", items: errors },
-            { title: "읽기 제한 및 참고", items: readWarnings },
-        ];
+        ].filter(section => section.items.length > 0);
         const issues = sections.reduce((sum, section) => sum + section.items.length, 0);
+        const activeThirdPartyExtensions = thirdPartyPaths.length;
         renderReport({
             createdAt: Date.now(),
             mode: "full",
             summary: {
-                extensions: paths.length,
-                sources: sourceCount(css.rules),
-                rules: css.rules.length,
-                issues,
+                extensions: activeThirdPartyExtensions,
+                activeCssEntries: css.persistent.activeEntryCount,
+                cssIssues: cssItems.length,
+                jsIssues: manifests.length,
             },
             sections,
             metadata: {
@@ -1054,7 +863,7 @@ async function runFullScan() {
                 recentStyleChanges: recentStyleChanges.length,
             },
         });
-        setStatus(`검사 완료 · 충돌 및 주의 ${issues}개`);
+        setStatus(issues ? `검사 완료 · 활성 충돌 ${issues}개` : "검사 완료 · 활성 충돌 없음");
     } catch (error) {
         console.error("[크로스체크] 전체 검사 실패", error);
         setStatus("검사 중 오류가 발생했습니다.");
@@ -1062,88 +871,6 @@ async function runFullScan() {
     } finally {
         if (button) button.disabled = false;
     }
-}
-
-async function inspectElement(element) {
-    setStatus(`${elementDescriptor(element)} 검사 중…`);
-    try {
-        const css = await collectAllCssRules();
-        const paths = discoverLoadedExtensionPaths();
-        const results = elementConflictResults(element, css.rules);
-        const sections = [{ title: "선택 요소 CSS 충돌", items: results }];
-        renderReport({
-            createdAt: Date.now(),
-            mode: "element",
-            target: elementDescriptor(element),
-            summary: {
-                extensions: paths.length,
-                sources: sourceCount(css.rules),
-                rules: css.rules.length,
-                issues: results.length,
-            },
-            sections,
-        });
-        setStatus(`요소 검사 완료 · 겹치는 속성 ${results.length}개`);
-    } catch (error) {
-        console.error("[크로스체크] 요소 검사 실패", error);
-        setStatus("요소 검사 중 오류가 발생했습니다.");
-    }
-}
-
-function clearHighlight() {
-    highlightedElement?.classList?.remove("crosscheck-pick-target");
-    highlightedElement = null;
-}
-
-function stopPicking() {
-    if (!picking) return;
-    picking = false;
-    clearHighlight();
-    document.querySelector("#crosscheck-pick-banner")?.classList.remove("cc-open");
-    document.removeEventListener("pointerover", handlePickHover, true);
-    document.removeEventListener("click", handlePickClick, true);
-    document.removeEventListener("keydown", handlePickKey, true);
-    setStatus("요소 선택을 취소했습니다.");
-}
-
-function handlePickHover(event) {
-    const target = event.target;
-    if (!(target instanceof Element) || target.closest("#crosscheck-pick-banner, #crosscheck-overlay")) return;
-    if (target === highlightedElement) return;
-    clearHighlight();
-    highlightedElement = target;
-    target.classList.add("crosscheck-pick-target");
-}
-
-function handlePickClick(event) {
-    const target = event.target;
-    if (!(target instanceof Element) || target.closest("#crosscheck-pick-banner, #crosscheck-overlay")) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation();
-    const selected = target;
-    picking = false;
-    clearHighlight();
-    document.querySelector("#crosscheck-pick-banner")?.classList.remove("cc-open");
-    document.removeEventListener("pointerover", handlePickHover, true);
-    document.removeEventListener("click", handlePickClick, true);
-    document.removeEventListener("keydown", handlePickKey, true);
-    setTimeout(() => inspectElement(selected), 0);
-}
-
-function handlePickKey(event) {
-    if (event.key === "Escape") stopPicking();
-}
-
-function startPicking() {
-    closeReport();
-    if (picking) return;
-    picking = true;
-    setStatus("검사할 화면 요소를 선택하세요.");
-    document.querySelector("#crosscheck-pick-banner")?.classList.add("cc-open");
-    document.addEventListener("pointerover", handlePickHover, true);
-    document.addEventListener("click", handlePickClick, true);
-    document.addEventListener("keydown", handlePickKey, true);
 }
 
 async function copyLatestReport() {
@@ -1167,14 +894,10 @@ function addUi() {
                 </div>
                 <div class="inline-drawer-content">
                     <div class="cc-actions">
-                        <button id="crosscheck-full-scan" type="button" class="menu_button cc-action">전체 검사</button>
-                        <button id="crosscheck-pick" type="button" class="menu_button cc-action">요소 선택</button>
+                        <button id="crosscheck-full-scan" type="button" class="menu_button cc-action">검사하기</button>
+                        <button id="crosscheck-open-last" type="button" class="menu_button cc-action" disabled>최근 결과</button>
                     </div>
-                    <label class="cc-option">
-                        <input id="crosscheck-include-disabled" type="checkbox">
-                        <span>꺼진 등록 CSS도 잠재 충돌 검사</span>
-                    </label>
-                    <div id="crosscheck-status" class="cc-status">검사를 시작할 수 있습니다.</div>
+                    <div id="crosscheck-status" class="cc-status">현재 켜진 확장과 등록 CSS만 검사합니다.</div>
                 </div>
             </div>
         </div>
@@ -1199,27 +922,16 @@ function addUi() {
     document.body.appendChild(overlay);
     enforceDialogLayout(false);
 
-    const banner = document.createElement("div");
-    banner.id = "crosscheck-pick-banner";
-    banner.innerHTML = `검사할 화면 요소를 누르세요.<button id="crosscheck-pick-cancel" type="button" aria-label="취소">×</button>`;
-    document.body.appendChild(banner);
-
-    const settings = getSettings();
-    $("#crosscheck-include-disabled").prop("checked", settings.includeDisabledPersistentCss);
     $("#crosscheck-full-scan").on("click", runFullScan);
-    $("#crosscheck-pick").on("click", startPicking);
+    $("#crosscheck-open-last").on("click", () => {
+        if (latestReport) renderReport(latestReport);
+    });
     $("#crosscheck-dialog-close").on("click", closeReport);
     $("#crosscheck-copy").on("click", copyLatestReport);
-    $("#crosscheck-rescan").on("click", () => latestReport?.mode === "element" ? startPicking() : runFullScan());
-    $("#crosscheck-pick-cancel").on("click", stopPicking);
+    $("#crosscheck-rescan").on("click", runFullScan);
     $("#crosscheck-overlay").on("click", event => {
         if (event.target?.id === "crosscheck-overlay") closeReport();
     });
-    $("#crosscheck-include-disabled").on("change", function () {
-        getSettings().includeDisabledPersistentCss = $(this).is(":checked");
-        saveSettingsDebounced();
-    });
-
     const refreshDialogLayout = () => {
         if (document.querySelector("#crosscheck-overlay")?.classList.contains("cc-open")) {
             enforceDialogLayout(true);
@@ -1231,7 +943,8 @@ function addUi() {
 
 function installErrorMonitor() {
     window.addEventListener("error", event => {
-        const message = event.message || event.error?.message || "알 수 없는 오류";
+        const message = event.message || event.error?.message || "";
+        if (!message || message === "Script error." || message === "알 수 없는 오류") return;
         if (/crosscheck/i.test(event.filename || "") || /크로스체크/.test(message)) return;
         recentErrors.push({
             type: "error",
@@ -1245,7 +958,8 @@ function installErrorMonitor() {
 
     window.addEventListener("unhandledrejection", event => {
         const reason = event.reason;
-        const message = reason?.message || String(reason || "알 수 없는 Promise 오류");
+        const message = reason?.message || String(reason || "");
+        if (!message || message === "알 수 없는 Promise 오류") return;
         if (/crosscheck/i.test(reason?.stack || "") || /크로스체크/.test(message)) return;
         recentErrors.push({
             type: "promise",

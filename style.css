@@ -234,46 +234,6 @@
     margin: 0;
 }
 
-#crosscheck-pick-banner {
-    position: fixed;
-    top: max(10px, env(safe-area-inset-top));
-    left: 50%;
-    z-index: 1000003;
-    display: none;
-    width: min(620px, calc(100vw - 20px));
-    padding: 10px 44px 10px 12px;
-    color: #fff;
-    background: rgba(28, 32, 39, .96);
-    border: 1px solid rgba(255, 255, 255, .3);
-    border-radius: 12px;
-    transform: translateX(-50%);
-    text-align: center;
-    pointer-events: none;
-}
-
-#crosscheck-pick-banner.cc-open {
-    display: block;
-}
-
-#crosscheck-pick-cancel {
-    position: absolute;
-    top: 50%;
-    right: 6px;
-    width: 32px;
-    height: 32px;
-    padding: 0;
-    border: 0;
-    color: #fff;
-    background: transparent;
-    transform: translateY(-50%);
-    pointer-events: auto;
-}
-
-.crosscheck-pick-target {
-    outline: 3px solid #ffb64d !important;
-    outline-offset: 3px !important;
-}
-
 @media (max-width: 600px) {
     #crosscheck-dialog {
         border-radius: 10px;
