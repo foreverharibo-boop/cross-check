@@ -4,7 +4,8 @@ import { saveSettingsDebounced } from "../../../../script.js";
 const MODULE_NAME = "crosscheck";
 const PCC_MODULE_NAME = "persistent-custom-css";
 const PCC_STYLE_ID = "persistent-custom-css-style";
-const MAX_RESULTS = 140;
+const MAX_RESULTS = 60;
+const VISIBLE_RESULTS_PER_SECTION = 6;
 const MAX_ERRORS = 30;
 
 const defaultSettings = {
@@ -183,7 +184,15 @@ function sourceFromStyleSheet(sheet, index) {
         return { key: `core:${pathname}`, label: `SillyTavern · ${pathname.split("/").pop()}`, kind: "core", href };
     }
 
-    if (/custom|user|theme/i.test(ownerId) || /custom|user|theme/i.test(owner?.dataset?.name || "")) {
+    if (/theme/i.test(ownerId) || ownerId === "custom-style" || /theme/i.test(owner?.dataset?.name || "")) {
+        return {
+            key: `theme:${ownerId || index}`,
+            label: `사용자/테마 CSS · ${ownerId || `inline-${index + 1}`}`,
+            kind: "theme",
+        };
+    }
+
+    if (/custom|user/i.test(ownerId) || /custom|user/i.test(owner?.dataset?.name || "")) {
         return {
             key: `custom:${ownerId || index}`,
             label: `사용자/테마 CSS · ${ownerId || `inline-${index + 1}`}`,
@@ -218,12 +227,14 @@ function walkCssRules(ruleList, source, state, output, diagnostics) {
             for (const selector of selectors) {
                 if (!selector || selector.startsWith("#crosscheck")) continue;
                 for (const property of Array.from(rule.style || [])) {
+                    const value = rule.style.getPropertyValue(property).trim();
+                    if (!value) continue;
                     output.push({
                         selector,
                         normalizedSelector: normalizeWhitespace(selector),
                         property,
                         family: propertyFamily(property),
-                        value: rule.style.getPropertyValue(property).trim(),
+                        value,
                         important: rule.style.getPropertyPriority(property) === "important",
                         active: state.active,
                         disabledSource: state.disabledSource,
@@ -265,6 +276,7 @@ function walkCssRules(ruleList, source, state, output, diagnostics) {
         if (rule.type === CSSRule.KEYFRAMES_RULE) {
             diagnostics.keyframes.push({
                 name: rule.name,
+                cssText: rule.cssText,
                 source,
                 active: state.active,
             });
@@ -400,16 +412,39 @@ function displayDeclaration(record) {
     return `${record.property}: ${shortText(record.value, 130)}${record.important ? " !important" : ""}`;
 }
 
+function isStructuralProperty(property) {
+    const prop = String(property || "").toLowerCase();
+    return /^(display|position|z-index|visibility|opacity|pointer-events|overflow(?:-|$)|width$|height$|min-|max-|flex(?:-|$)|grid(?:-|$)|order$|float$|clear$|transform(?:-|$)|translate$|scale$|rotate$|top$|right$|bottom$|left$|inset(?:-|$)|margin(?:-|$)|padding(?:-|$)|box-sizing$|content$|clip(?:-|$))/.test(prop);
+}
+
+function shouldReportRuleConflict(records) {
+    const activeOrPotential = records.filter(Boolean);
+    const actorRecords = activeOrPotential.filter(record => ["persistent", "extension"].includes(record.source.kind));
+    const actorSources = distinctSources(actorRecords);
+    const hasTheme = activeOrPotential.some(record => ["theme", "custom"].includes(record.source.kind));
+    const hasCore = activeOrPotential.some(record => record.source.kind === "core");
+    const hasImportant = activeOrPotential.some(record => record.important);
+    const property = activeOrPotential[0]?.property;
+
+    // 서로 다른 등록 CSS/확장이 같은 속성을 만지는 경우가 가장 확실한 충돌 후보다.
+    if (actorSources.size >= 2) return true;
+    // 테마나 기본 CSS를 단순히 꾸며서 덮는 것은 정상 동작이다. 레이아웃을 바꾸거나
+    // !important가 개입한 경우에만 전체 검사에서 보여준다.
+    if (actorSources.size === 1 && hasTheme) return isStructuralProperty(property) || hasImportant;
+    if (actorSources.size === 1 && hasCore) return isStructuralProperty(property) && hasImportant;
+    return false;
+}
+
 function conflictResultsFromRules(rules) {
     const groups = new Map();
 
     for (const rule of rules) {
-        const key = `${rule.normalizedSelector}\u0000${rule.family}`;
+        const key = `${rule.normalizedSelector}\u0000${rule.property}`;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(rule);
     }
 
-    const results = [];
+    const candidates = [];
     for (const records of groups.values()) {
         if (records.length < 2 || distinctSources(records).size < 2 || distinctDeclarations(records).size < 2) continue;
         if (!records.some(record => isInterestingSource(record.source))) continue;
@@ -419,24 +454,50 @@ function conflictResultsFromRules(rules) {
         const activeDeclarations = distinctDeclarations(activeRecords);
         const confirmedCandidate = activeRecords.length > 1 && activeSources.size > 1 && activeDeclarations.size > 1;
         const hasInactive = records.some(record => !record.active);
+        const relevantRecords = confirmedCandidate ? activeRecords : records;
+        if (!shouldReportRuleConflict(relevantRecords)) continue;
         const selector = records[0].selector;
-        const family = records[0].family;
+        const property = records[0].property;
         const sorted = [...records].sort((a, b) => a.order - b.order);
         const lines = sorted.slice(-6).map(record => ({
             source: record.source.label,
             text: `${displayDeclaration(record)}${record.active ? "" : " · 현재 비활성"}${record.media ? ` · @media ${record.media}` : ""}`,
         }));
 
-        results.push({
+        candidates.push({
             level: confirmedCandidate ? "high" : "medium",
             title: confirmedCandidate ? "활성 CSS 충돌 후보" : "비활성 CSS 잠재 충돌",
-            meta: `${selector}  ·  ${family}`,
+            selector,
+            property,
             lines,
             inactive: !confirmedCandidate && hasInactive,
         });
     }
 
-    return results
+    // 같은 선택자에서 여러 속성이 겹쳐도 카드 하나로 묶어서 결과 폭증을 막는다.
+    const aggregated = new Map();
+    for (const item of candidates) {
+        const key = `${item.level}\u0000${item.selector}`;
+        if (!aggregated.has(key)) {
+            aggregated.set(key, { ...item, properties: [], lines: [] });
+        }
+        const target = aggregated.get(key);
+        target.properties.push(item.property);
+        for (const line of item.lines) {
+            const lineKey = `${line.source}\u0000${line.text}`;
+            if (!target.lines.some(existing => `${existing.source}\u0000${existing.text}` === lineKey)) {
+                target.lines.push(line);
+            }
+        }
+    }
+
+    return Array.from(aggregated.values())
+        .map(item => ({
+            level: item.level,
+            title: `${item.title}${item.properties.length > 1 ? ` · ${item.properties.length}개 속성` : ""}`,
+            meta: `${item.selector} · ${item.properties.slice(0, 8).join(", ")}${item.properties.length > 8 ? "…" : ""}`,
+            lines: item.lines.slice(-10),
+        }))
         .sort((a, b) => (a.level === b.level ? 0 : a.level === "high" ? -1 : 1))
         .slice(0, MAX_RESULTS);
 }
@@ -450,8 +511,14 @@ function duplicateIdResults() {
     }
 
     return Array.from(byId.entries())
-        .filter(([, elements]) => elements.length > 1)
-        .slice(0, 30)
+        .filter(([id, elements]) => {
+            if (elements.length < 2) return false;
+            if (/^[0-9]+$/.test(id)) return false;
+            if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) return false;
+            if (elements.every(element => element.classList.contains("tag"))) return false;
+            return true;
+        })
+        .slice(0, 15)
         .map(([id, elements]) => ({
             level: "medium",
             title: "중복 DOM ID",
@@ -468,7 +535,7 @@ function keyframeResults(keyframes) {
         groups.get(item.name).push(item);
     }
     return Array.from(groups.entries())
-        .filter(([, items]) => distinctSources(items).size > 1)
+        .filter(([, items]) => distinctSources(items).size > 1 && new Set(items.map(item => normalizeWhitespace(item.cssText))).size > 1)
         .map(([name, items]) => ({
             level: "medium",
             title: "애니메이션 이름 중복",
@@ -583,7 +650,8 @@ function extensionCodeResults(manifests) {
 
     const results = [];
     for (const [name, items] of globalNames.entries()) {
-        const unique = new Map(items.map(item => [item.path, item]));
+        if (name.startsWith("__")) continue;
+        const unique = new Map(items.filter(item => item.path.startsWith("third-party/")).map(item => [item.path, item]));
         if (unique.size < 2) continue;
         results.push({
             level: "high",
@@ -593,7 +661,7 @@ function extensionCodeResults(manifests) {
         });
     }
     for (const [key, items] of settingKeys.entries()) {
-        const unique = new Map(items.map(item => [item.path, item]));
+        const unique = new Map(items.filter(item => item.path.startsWith("third-party/")).map(item => [item.path, item]));
         if (unique.size < 2) continue;
         results.push({
             level: "high",
@@ -740,13 +808,13 @@ function elementConflictResults(element, rules) {
 
     const groups = new Map();
     for (const rule of matching) {
-        if (!groups.has(rule.family)) groups.set(rule.family, []);
-        groups.get(rule.family).push(rule);
+        if (!groups.has(rule.property)) groups.set(rule.property, []);
+        groups.get(rule.property).push(rule);
     }
 
     const computed = getComputedStyle(element);
     const results = [];
-    for (const [family, records] of groups.entries()) {
+    for (const [property, records] of groups.entries()) {
         if (records.length < 2 || distinctSources(records).size < 2 || distinctDeclarations(records).size < 2) continue;
         if (!records.some(record => isInterestingSource(record.source))) continue;
 
@@ -760,7 +828,7 @@ function elementConflictResults(element, rules) {
         results.push({
             level: "high",
             title: "선택 요소에 실제로 겹치는 규칙",
-            meta: `${family} · 현재 계산값: ${shortText(computedValue || "확인 불가", 120)}`,
+            meta: `${property} · 현재 계산값: ${shortText(computedValue || "확인 불가", 120)}`,
             lines,
         });
     }
@@ -796,17 +864,85 @@ function buildReportText(report) {
     return lines.join("\n");
 }
 
-function reportItemHtml(item) {
+function reportItemHtml(item, extra = false) {
     const lines = (item.lines || []).map(line => `
         <div class="cc-rule-line"><span class="cc-source">${escapeHtml(line.source)}</span> — ${escapeHtml(line.text)}</div>
     `).join("");
     return `
-        <div class="cc-result" data-level="${escapeHtml(item.level || "info")}">
+        <div class="cc-result${extra ? " cc-extra-result" : ""}" data-level="${escapeHtml(item.level || "info")}">
             <div class="cc-result-title">${escapeHtml(item.title)}</div>
             ${item.meta ? `<div class="cc-result-meta">${escapeHtml(item.meta)}</div>` : ""}
             ${lines}
         </div>
     `;
+}
+
+function setImportantStyle(element, property, value) {
+    element?.style?.setProperty(property, value, "important");
+}
+
+function enforceDialogLayout(open) {
+    const overlay = document.querySelector("#crosscheck-overlay");
+    const dialog = document.querySelector("#crosscheck-dialog");
+    const body = document.querySelector("#crosscheck-dialog-body");
+    const head = document.querySelector("#crosscheck-dialog .cc-dialog-head");
+    const foot = document.querySelector("#crosscheck-dialog .cc-dialog-foot");
+    if (!overlay || !dialog || !body || !head || !foot) return;
+
+    const mobile = window.matchMedia("(max-width: 700px)").matches;
+    const overlayStyles = {
+        position: "fixed",
+        top: "0",
+        right: "0",
+        bottom: "0",
+        left: "0",
+        width: "100vw",
+        height: "100dvh",
+        margin: "0",
+        transform: "none",
+        "box-sizing": "border-box",
+        "z-index": "2147483646",
+        display: open ? "flex" : "none",
+        "align-items": "center",
+        "justify-content": "center",
+        padding: mobile ? "6px" : "12px",
+        overflow: "hidden",
+    };
+    for (const [property, value] of Object.entries(overlayStyles)) setImportantStyle(overlay, property, value);
+
+    const dialogStyles = {
+        position: "relative",
+        top: "auto",
+        right: "auto",
+        bottom: "auto",
+        left: "auto",
+        width: mobile ? "calc(100vw - 12px)" : "min(820px, calc(100vw - 24px))",
+        height: mobile ? "calc(100dvh - 12px)" : "min(88dvh, 900px)",
+        "max-width": mobile ? "none" : "820px",
+        "max-height": "none",
+        margin: "0",
+        transform: "none",
+        display: "flex",
+        "flex-direction": "column",
+        overflow: "hidden",
+        "box-sizing": "border-box",
+    };
+    for (const [property, value] of Object.entries(dialogStyles)) setImportantStyle(dialog, property, value);
+    setImportantStyle(body, "min-height", "0");
+    setImportantStyle(body, "flex", "1 1 auto");
+    setImportantStyle(body, "overflow", "auto");
+    setImportantStyle(body, "position", "relative");
+    setImportantStyle(body, "transform", "none");
+    for (const fixedPart of [head, foot]) {
+        setImportantStyle(fixedPart, "position", "relative");
+        setImportantStyle(fixedPart, "top", "auto");
+        setImportantStyle(fixedPart, "right", "auto");
+        setImportantStyle(fixedPart, "bottom", "auto");
+        setImportantStyle(fixedPart, "left", "auto");
+        setImportantStyle(fixedPart, "width", "100%");
+        setImportantStyle(fixedPart, "transform", "none");
+        setImportantStyle(fixedPart, "flex", "0 0 auto");
+    }
 }
 
 function renderReport(report) {
@@ -815,10 +951,11 @@ function renderReport(report) {
     const title = report.mode === "element" ? `요소 검사 · ${report.target}` : "전체 검사 결과";
     document.querySelector("#crosscheck-dialog-title").textContent = title;
 
-    const sections = report.sections.map(section => `
+    const sections = report.sections.map((section, sectionIndex) => `
         <section class="cc-section">
             <h3 class="cc-section-title">${escapeHtml(section.title)} (${section.items.length})</h3>
-            ${section.items.length ? section.items.map(reportItemHtml).join("") : '<div class="cc-empty">발견된 항목이 없습니다.</div>'}
+            ${section.items.length ? section.items.map((item, index) => reportItemHtml(item, index >= VISIBLE_RESULTS_PER_SECTION)).join("") : '<div class="cc-empty">발견된 항목이 없습니다.</div>'}
+            ${section.items.length > VISIBLE_RESULTS_PER_SECTION ? `<button type="button" class="menu_button cc-show-more" data-section="${sectionIndex}" data-more="${section.items.length - VISIBLE_RESULTS_PER_SECTION}">${section.items.length - VISIBLE_RESULTS_PER_SECTION}개 더 보기</button>` : ""}
         </section>
     `).join("");
 
@@ -831,11 +968,21 @@ function renderReport(report) {
         </div>
         ${sections}
     `;
+    body.scrollTop = 0;
+    body.querySelectorAll(".cc-show-more").forEach(button => {
+        button.addEventListener("click", () => {
+            const section = button.closest(".cc-section");
+            const expanded = section.classList.toggle("cc-expanded");
+            button.textContent = expanded ? "접기" : `${button.dataset.more}개 더 보기`;
+        });
+    });
     document.querySelector("#crosscheck-overlay").classList.add("cc-open");
+    enforceDialogLayout(true);
 }
 
 function closeReport() {
     document.querySelector("#crosscheck-overlay")?.classList.remove("cc-open");
+    enforceDialogLayout(false);
 }
 
 async function runFullScan() {
@@ -1050,6 +1197,7 @@ function addUi() {
         </div>
     `;
     document.body.appendChild(overlay);
+    enforceDialogLayout(false);
 
     const banner = document.createElement("div");
     banner.id = "crosscheck-pick-banner";
@@ -1071,6 +1219,14 @@ function addUi() {
         getSettings().includeDisabledPersistentCss = $(this).is(":checked");
         saveSettingsDebounced();
     });
+
+    const refreshDialogLayout = () => {
+        if (document.querySelector("#crosscheck-overlay")?.classList.contains("cc-open")) {
+            enforceDialogLayout(true);
+        }
+    };
+    window.addEventListener("resize", refreshDialogLayout, { passive: true });
+    window.visualViewport?.addEventListener("resize", refreshDialogLayout, { passive: true });
 }
 
 function installErrorMonitor() {
